@@ -58,7 +58,7 @@ private enum SystemNotifier {
 
         let notification = NSUserNotification()
         notification.title = "启动静音"
-        notification.informativeText = "已将系统静音。"
+        notification.informativeText = "已静音 MacBook Pro 扬声器。"
         center.deliver(notification)
     }
 }
@@ -67,71 +67,187 @@ private enum CoreAudioMuter {
     private static let outputScope = AudioObjectPropertyScope(kAudioDevicePropertyScopeOutput)
     private static let mainElement = AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
     private static let elementsToTry = [mainElement] + (1...8).map(AudioObjectPropertyElement.init)
+    private static let builtInTransportType = UInt32(kAudioDeviceTransportTypeBuiltIn)
 
     struct Result {
         let changed: Bool
         let details: [String]
     }
 
-    static func muteCurrentOutputs() -> Result {
-        var seenDevices = Set<AudioObjectID>()
+    private struct OutputDevice {
+        let id: AudioObjectID
+        let name: String
+        let uid: String
+        let transportType: UInt32?
+    }
+
+    static func muteBuiltInSpeakers() -> Result {
         var details: [String] = []
         var changed = false
+        let outputDevices = readOutputDevices()
+        let targetDevices = outputDevices.filter(isBuiltInSpeaker)
 
-        let selectors: [(AudioObjectPropertySelector, String)] = [
-            (AudioObjectPropertySelector(kAudioHardwarePropertyDefaultOutputDevice), "default-output"),
-            (AudioObjectPropertySelector(kAudioHardwarePropertyDefaultSystemOutputDevice), "system-output")
-        ]
-
-        for (selector, label) in selectors {
-            guard let deviceID = readDeviceID(selector: selector, label: label) else {
-                details.append("\(label): no device")
-                continue
-            }
-
-            guard deviceID != AudioObjectID(kAudioObjectUnknown) else {
-                details.append("\(label): unknown device")
-                continue
-            }
-
-            if !seenDevices.insert(deviceID).inserted {
-                continue
-            }
-
-            let deviceResult = muteDevice(deviceID)
+        for device in targetDevices {
+            let deviceResult = muteDevice(device.id)
             changed = changed || deviceResult.changed
-            details.append("\(label): device \(deviceID), \(deviceResult.details.joined(separator: ", "))")
+            details.append("\(device.name) [id=\(device.id), uid=\(device.uid)], \(deviceResult.details.joined(separator: ", "))")
+        }
+
+        if targetDevices.isEmpty {
+            let deviceSummary = outputDevices
+                .map { "\($0.name) [id=\($0.id), uid=\($0.uid), transport=\($0.transportType.map(String.init) ?? "unknown")]" }
+                .joined(separator: "; ")
+            details.append("no built-in MacBook speaker found; outputs=\(deviceSummary)")
         }
 
         return Result(changed: changed, details: details)
     }
 
-    private static func readDeviceID(
+    private static func readOutputDevices() -> [OutputDevice] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyDevices),
+            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+            mElement: mainElement
+        )
+
+        var dataSize: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize
+        )
+        guard status == noErr, dataSize > 0 else {
+            Log.error("failed to read CoreAudio device list size: OSStatus \(status)")
+            return []
+        }
+
+        let deviceCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var deviceIDs = [AudioObjectID](repeating: AudioObjectID(kAudioObjectUnknown), count: deviceCount)
+        status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &deviceIDs
+        )
+        if status != noErr {
+            Log.error("failed to read CoreAudio device list: OSStatus \(status)")
+            return []
+        }
+
+        return deviceIDs.compactMap { deviceID in
+            guard deviceID != AudioObjectID(kAudioObjectUnknown), isOutputDevice(deviceID) else {
+                return nil
+            }
+
+            return OutputDevice(
+                id: deviceID,
+                name: readStringProperty(
+                    selector: AudioObjectPropertySelector(kAudioObjectPropertyName),
+                    deviceID: deviceID
+                ) ?? "unknown",
+                uid: readStringProperty(
+                    selector: AudioObjectPropertySelector(kAudioDevicePropertyDeviceUID),
+                    deviceID: deviceID
+                ) ?? "unknown",
+                transportType: readUInt32Property(
+                    selector: AudioObjectPropertySelector(kAudioDevicePropertyTransportType),
+                    deviceID: deviceID
+                )
+            )
+        }
+    }
+
+    private static func isOutputDevice(_ deviceID: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: AudioObjectPropertySelector(kAudioDevicePropertyStreamConfiguration),
+            mScope: outputScope,
+            mElement: mainElement
+        )
+
+        var dataSize: UInt32 = 0
+        let sizeStatus = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize)
+        guard sizeStatus == noErr, dataSize > 0 else {
+            return false
+        }
+
+        let rawPointer = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(dataSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer {
+            rawPointer.deallocate()
+        }
+
+        let dataStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, rawPointer)
+        guard dataStatus == noErr else {
+            return false
+        }
+
+        let bufferListPointer = rawPointer.assumingMemoryBound(to: AudioBufferList.self)
+        let buffers = UnsafeMutableAudioBufferListPointer(bufferListPointer)
+        return buffers.contains { $0.mNumberChannels > 0 }
+    }
+
+    private static func isBuiltInSpeaker(_ device: OutputDevice) -> Bool {
+        let lowercasedName = device.name.lowercased()
+        let lowercasedUID = device.uid.lowercased()
+        let looksLikeSpeakerName = lowercasedName.contains("扬声器")
+            || lowercasedName.contains("speaker")
+        let looksLikeMacBookSpeakerName = lowercasedName.contains("macbook")
+            || lowercasedName.contains("built-in")
+            || lowercasedName.contains("internal")
+            || lowercasedName.contains("内置")
+        let looksLikeBuiltInSpeakerUID = lowercasedUID.contains("builtinspeaker")
+            || lowercasedUID.contains("builtinoutput")
+        let isBuiltInTransport = device.transportType == builtInTransportType
+
+        return looksLikeBuiltInSpeakerUID
+            || (isBuiltInTransport && looksLikeSpeakerName && looksLikeMacBookSpeakerName)
+    }
+
+    private static func readStringProperty(
         selector: AudioObjectPropertySelector,
-        label: String
-    ) -> AudioObjectID? {
+        deviceID: AudioObjectID
+    ) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
             mElement: mainElement
         )
-        var deviceID = AudioObjectID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            &size,
-            &deviceID
-        )
+        var value: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
 
-        if status != noErr {
-            Log.error("failed to read \(label) device: OSStatus \(status)")
+        guard status == noErr else {
             return nil
         }
 
-        return deviceID
+        return value as String
+    }
+
+    private static func readUInt32Property(
+        selector: AudioObjectPropertySelector,
+        deviceID: AudioObjectID
+    ) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+            mElement: mainElement
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        guard status == noErr else {
+            return nil
+        }
+
+        return value
     }
 
     private static func muteDevice(_ deviceID: AudioObjectID) -> Result {
@@ -234,12 +350,12 @@ private enum CoreAudioMuter {
 
 private enum VolumeMuter {
     static func mute(reason: String) {
-        let result = CoreAudioMuter.muteCurrentOutputs()
+        let result = CoreAudioMuter.muteBuiltInSpeakers()
         if result.changed {
-            Log.info("muted output volume for \(reason): \(result.details.joined(separator: "; "))")
+            Log.info("muted built-in speaker volume for \(reason): \(result.details.joined(separator: "; "))")
             SystemNotifier.showMutedNotification()
         } else {
-            Log.error("did not find a settable output volume/mute control for \(reason): \(result.details.joined(separator: "; "))")
+            Log.error("did not mute built-in speaker for \(reason): \(result.details.joined(separator: "; "))")
         }
     }
 }
@@ -405,7 +521,7 @@ private func printHelp() {
 
     Usage:
       mute-on-startup-agent            Run as a wake/listen daemon.
-      mute-on-startup-agent --once     Mute output and alert volume once.
+      mute-on-startup-agent --once     Mute built-in MacBook speaker once.
       mute-on-startup-agent --help     Show this help.
     """)
 }
