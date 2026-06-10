@@ -5,7 +5,7 @@ import Foundation
 
 private var signalSources: [DispatchSourceSignal] = []
 private var notificationObservers: [NSObjectProtocol] = []
-private var pendingWakeMute: DispatchWorkItem?
+private var pendingWakeAction: DispatchWorkItem?
 private let wakeMuteDelay: TimeInterval = 3.0
 
 private enum AgentMode {
@@ -242,16 +242,93 @@ private enum VolumeMuter {
             Log.error("did not find a settable output volume/mute control for \(reason): \(result.details.joined(separator: "; "))")
         }
     }
+}
+
+private enum MorningWindow {
+    private static let startMinuteOfDay = 6 * 60 + 30
+    private static let endMinuteOfDay = 12 * 60
+
+    static func contains(_ date: Date = Date(), calendar: Calendar = .current) -> Bool {
+        let components = calendar.dateComponents([.hour, .minute], from: date)
+        guard let hour = components.hour, let minute = components.minute else {
+            return false
+        }
+
+        let minuteOfDay = hour * 60 + minute
+        return minuteOfDay >= startMinuteOfDay && minuteOfDay < endMinuteOfDay
+    }
+}
+
+private enum AppearanceManager {
+    private static let appearanceKey = "AppleInterfaceStyle" as CFString
+    private static let themeChangedNotification = Notification.Name("AppleInterfaceThemeChangedNotification")
+
+    static func disableDarkModeDuringMorning(reason: String) {
+        guard MorningWindow.contains() else {
+            Log.info("skipped light appearance for \(reason): outside 06:30-12:00")
+            return
+        }
+
+        let hosts = [
+            kCFPreferencesAnyHost,
+            kCFPreferencesCurrentHost
+        ]
+        let previousStyles = hosts.compactMap { host -> String? in
+            guard let style = CFPreferencesCopyValue(
+                appearanceKey,
+                kCFPreferencesAnyApplication,
+                kCFPreferencesCurrentUser,
+                host
+            ) as? String else {
+                return nil
+            }
+
+            return "\(host)=\(style)"
+        }
+
+        for host in hosts {
+            CFPreferencesSetValue(
+                appearanceKey,
+                nil,
+                kCFPreferencesAnyApplication,
+                kCFPreferencesCurrentUser,
+                host
+            )
+        }
+
+        let synchronized = hosts
+            .map { CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, $0) }
+            .allSatisfy { $0 }
+
+        DistributedNotificationCenter.default().post(
+            name: themeChangedNotification,
+            object: nil
+        )
+
+        if synchronized {
+            let previousDescription = previousStyles.isEmpty ? "unset" : previousStyles.joined(separator: ", ")
+            Log.info("applied light appearance for \(reason): previous AppleInterfaceStyle=\(previousDescription)")
+        } else {
+            Log.error("requested light appearance for \(reason), but CFPreferencesSynchronize returned false")
+        }
+    }
+}
+
+private enum StartupActions {
+    static func run(reason: String) {
+        VolumeMuter.mute(reason: reason)
+        AppearanceManager.disableDarkModeDuringMorning(reason: reason)
+    }
 
     static func scheduleWakeMute(reason: String) {
-        pendingWakeMute?.cancel()
+        pendingWakeAction?.cancel()
 
         let workItem = DispatchWorkItem {
-            mute(reason: reason)
+            run(reason: reason)
         }
-        pendingWakeMute = workItem
+        pendingWakeAction = workItem
 
-        Log.info("scheduled output mute for \(reason) in \(wakeMuteDelay)s")
+        Log.info("scheduled wake actions for \(reason) in \(wakeMuteDelay)s")
         DispatchQueue.main.asyncAfter(deadline: .now() + wakeMuteDelay, execute: workItem)
     }
 }
@@ -300,7 +377,7 @@ case .once:
 
 case .daemon:
     installTerminationHandlers()
-    VolumeMuter.mute(reason: "agent-start")
+    StartupActions.run(reason: "agent-start")
 
     let workspaceNotifications = NSWorkspace.shared.notificationCenter
     let wakeObserver = workspaceNotifications.addObserver(
@@ -308,7 +385,7 @@ case .daemon:
         object: nil,
         queue: .main
     ) { _ in
-        VolumeMuter.scheduleWakeMute(reason: "system-wake")
+        StartupActions.scheduleWakeMute(reason: "system-wake")
     }
     notificationObservers.append(wakeObserver)
 
