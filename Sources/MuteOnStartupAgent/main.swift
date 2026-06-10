@@ -261,7 +261,16 @@ private enum MorningWindow {
 
 private enum AppearanceManager {
     private static let appearanceKey = "AppleInterfaceStyle" as CFString
+    private static let automaticSwitchKey = "AppleInterfaceStyleSwitchesAutomatically" as CFString
+    private static let osascriptPath = "/usr/bin/osascript"
     private static let themeChangedNotification = Notification.Name("AppleInterfaceThemeChangedNotification")
+    private static let disableDarkModeScript = [
+        "tell application \"System Events\"",
+        "  tell appearance preferences",
+        "    set dark mode to false",
+        "  end tell",
+        "end tell"
+    ]
 
     static func disableDarkModeDuringMorning(reason: String) {
         guard MorningWindow.contains() else {
@@ -269,6 +278,7 @@ private enum AppearanceManager {
             return
         }
 
+        let systemEventsApplied = disableDarkModeUsingSystemEvents(reason: reason)
         let hosts = [
             kCFPreferencesAnyHost,
             kCFPreferencesCurrentHost
@@ -294,6 +304,13 @@ private enum AppearanceManager {
                 kCFPreferencesCurrentUser,
                 host
             )
+            CFPreferencesSetValue(
+                automaticSwitchKey,
+                kCFBooleanFalse,
+                kCFPreferencesAnyApplication,
+                kCFPreferencesCurrentUser,
+                host
+            )
         }
 
         let synchronized = hosts
@@ -307,10 +324,38 @@ private enum AppearanceManager {
 
         if synchronized {
             let previousDescription = previousStyles.isEmpty ? "unset" : previousStyles.joined(separator: ", ")
-            Log.info("applied light appearance for \(reason): previous AppleInterfaceStyle=\(previousDescription)")
+            Log.info("applied light appearance for \(reason): systemEvents=\(systemEventsApplied), previous AppleInterfaceStyle=\(previousDescription)")
         } else {
             Log.error("requested light appearance for \(reason), but CFPreferencesSynchronize returned false")
         }
+    }
+
+    private static func disableDarkModeUsingSystemEvents(reason: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: osascriptPath)
+        process.arguments = disableDarkModeScript.flatMap { ["-e", $0] }
+
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        process.standardOutput = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            Log.error("failed to start System Events appearance script for \(reason): \(error)")
+            return false
+        }
+
+        guard process.terminationStatus == 0 else {
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let errorMessage = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            Log.error("System Events appearance script exited with \(process.terminationStatus) for \(reason): \(errorMessage ?? "no stderr")")
+            return false
+        }
+
+        return true
     }
 }
 
@@ -320,7 +365,7 @@ private enum StartupActions {
         AppearanceManager.disableDarkModeDuringMorning(reason: reason)
     }
 
-    static func scheduleWakeMute(reason: String) {
+    static func scheduleWakeActions(reason: String) {
         pendingWakeAction?.cancel()
 
         let workItem = DispatchWorkItem {
@@ -385,7 +430,7 @@ case .daemon:
         object: nil,
         queue: .main
     ) { _ in
-        StartupActions.scheduleWakeMute(reason: "system-wake")
+        StartupActions.scheduleWakeActions(reason: "system-wake")
     }
     notificationObservers.append(wakeObserver)
 
