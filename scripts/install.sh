@@ -58,6 +58,8 @@ cat > "$INFO_PLIST_PATH" <<APPPLIST
 </plist>
 APPPLIST
 
+codesign --force --deep --sign - "$APP_BUNDLE_PATH"
+
 if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$UID" "$PLIST_PATH" >/dev/null 2>&1 || \
     launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true

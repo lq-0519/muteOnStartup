@@ -64,13 +64,22 @@ private enum SystemNotifier {
 }
 
 private enum CoreAudioMuter {
+    private static let globalScope = AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal)
     private static let outputScope = AudioObjectPropertyScope(kAudioDevicePropertyScopeOutput)
     private static let mainElement = AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
     private static let elementsToTry = [mainElement] + (1...8).map(AudioObjectPropertyElement.init)
     private static let builtInTransportType = UInt32(kAudioDeviceTransportTypeBuiltIn)
+    private static let silenceThreshold: Float32 = 0.0001
+
+    enum Status {
+        case muted
+        case alreadySilent
+        case notFound
+        case failed
+    }
 
     struct Result {
-        let changed: Bool
+        let status: Status
         let details: [String]
     }
 
@@ -81,16 +90,71 @@ private enum CoreAudioMuter {
         let transportType: UInt32?
     }
 
+    private struct DeviceMuteResult {
+        let changed: Bool
+        let details: [String]
+    }
+
+    private struct OutputState {
+        let isMuted: Bool?
+        let maxVolume: Float32?
+        let readableVolumes: [(element: AudioObjectPropertyElement, value: Float32)]
+        let readableMutes: [(element: AudioObjectPropertyElement, value: UInt32)]
+
+        var needsMute: Bool {
+            if isMuted == true {
+                return false
+            }
+
+            guard let maxVolume else {
+                return true
+            }
+
+            return maxVolume > CoreAudioMuter.silenceThreshold
+        }
+
+        var summary: String {
+            let muteDescription = isMuted.map { String($0) } ?? "unknown"
+            let volumeDescription = maxVolume.map(CoreAudioMuter.formatVolume) ?? "unknown"
+            let volumeElements = readableVolumes
+                .map { "volume element \($0.element)=\(CoreAudioMuter.formatVolume($0.value))" }
+                .joined(separator: ", ")
+            let muteElements = readableMutes
+                .map { "mute element \($0.element)=\($0.value)" }
+                .joined(separator: ", ")
+            let readableDescription = [
+                volumeElements.isEmpty ? nil : volumeElements,
+                muteElements.isEmpty ? nil : muteElements
+            ]
+                .compactMap { $0 }
+                .joined(separator: ", ")
+
+            if readableDescription.isEmpty {
+                return "current muted=\(muteDescription), maxVolume=\(volumeDescription)"
+            }
+
+            return "current muted=\(muteDescription), maxVolume=\(volumeDescription), \(readableDescription)"
+        }
+    }
+
     static func muteBuiltInSpeakers() -> Result {
         var details: [String] = []
         var changed = false
+        var attemptedMute = false
         let outputDevices = readOutputDevices()
         let targetDevices = outputDevices.filter(isBuiltInSpeaker)
 
         for device in targetDevices {
+            let state = readOutputState(device.id)
+            if !state.needsMute {
+                details.append("\(device.name) [id=\(device.id), uid=\(device.uid)], already silent, \(state.summary)")
+                continue
+            }
+
+            attemptedMute = true
             let deviceResult = muteDevice(device.id)
             changed = changed || deviceResult.changed
-            details.append("\(device.name) [id=\(device.id), uid=\(device.uid)], \(deviceResult.details.joined(separator: ", "))")
+            details.append("\(device.name) [id=\(device.id), uid=\(device.uid)], \(state.summary), \(deviceResult.details.joined(separator: ", "))")
         }
 
         if targetDevices.isEmpty {
@@ -98,15 +162,20 @@ private enum CoreAudioMuter {
                 .map { "\($0.name) [id=\($0.id), uid=\($0.uid), transport=\($0.transportType.map(String.init) ?? "unknown")]" }
                 .joined(separator: "; ")
             details.append("no built-in MacBook speaker found; outputs=\(deviceSummary)")
+            return Result(status: .notFound, details: details)
         }
 
-        return Result(changed: changed, details: details)
+        if changed {
+            return Result(status: .muted, details: details)
+        }
+
+        return Result(status: attemptedMute ? .failed : .alreadySilent, details: details)
     }
 
     private static func readOutputDevices() -> [OutputDevice] {
         var address = AudioObjectPropertyAddress(
             mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyDevices),
-            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+            mScope: globalScope,
             mElement: mainElement
         )
 
@@ -155,7 +224,9 @@ private enum CoreAudioMuter {
                 ) ?? "unknown",
                 transportType: readUInt32Property(
                     selector: AudioObjectPropertySelector(kAudioDevicePropertyTransportType),
-                    deviceID: deviceID
+                    deviceID: deviceID,
+                    scope: globalScope,
+                    element: mainElement
                 )
             )
         }
@@ -209,13 +280,54 @@ private enum CoreAudioMuter {
             || (isBuiltInTransport && looksLikeSpeakerName && looksLikeMacBookSpeakerName)
     }
 
+    private static func readOutputState(_ deviceID: AudioObjectID) -> OutputState {
+        let readableVolumes = elementsToTry.compactMap { element -> (element: AudioObjectPropertyElement, value: Float32)? in
+            guard let value = readFloat32Property(
+                selector: AudioObjectPropertySelector(kAudioDevicePropertyVolumeScalar),
+                deviceID: deviceID,
+                scope: outputScope,
+                element: element
+            ) else {
+                return nil
+            }
+
+            return (element: element, value: value)
+        }
+        let readableMutes = elementsToTry.compactMap { element -> (element: AudioObjectPropertyElement, value: UInt32)? in
+            guard let value = readUInt32Property(
+                selector: AudioObjectPropertySelector(kAudioDevicePropertyMute),
+                deviceID: deviceID,
+                scope: outputScope,
+                element: element
+            ) else {
+                return nil
+            }
+
+            return (element: element, value: value)
+        }
+        let isMuted: Bool?
+        if readableMutes.isEmpty {
+            isMuted = nil
+        } else {
+            isMuted = readableMutes.contains { $0.value != 0 }
+        }
+        let maxVolume = readableVolumes.map { $0.value }.max()
+
+        return OutputState(
+            isMuted: isMuted,
+            maxVolume: maxVolume,
+            readableVolumes: readableVolumes,
+            readableMutes: readableMutes
+        )
+    }
+
     private static func readStringProperty(
         selector: AudioObjectPropertySelector,
         deviceID: AudioObjectID
     ) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
-            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+            mScope: globalScope,
             mElement: mainElement
         )
         var value: CFString = "" as CFString
@@ -233,13 +345,19 @@ private enum CoreAudioMuter {
 
     private static func readUInt32Property(
         selector: AudioObjectPropertySelector,
-        deviceID: AudioObjectID
+        deviceID: AudioObjectID,
+        scope: AudioObjectPropertyScope,
+        element: AudioObjectPropertyElement
     ) -> UInt32? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
-            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
-            mElement: mainElement
+            mScope: scope,
+            mElement: element
         )
+        guard AudioObjectHasProperty(deviceID, &address) else {
+            return nil
+        }
+
         var value: UInt32 = 0
         var size = UInt32(MemoryLayout<UInt32>.size)
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
@@ -250,7 +368,36 @@ private enum CoreAudioMuter {
         return value
     }
 
-    private static func muteDevice(_ deviceID: AudioObjectID) -> Result {
+    private static func readFloat32Property(
+        selector: AudioObjectPropertySelector,
+        deviceID: AudioObjectID,
+        scope: AudioObjectPropertyScope,
+        element: AudioObjectPropertyElement
+    ) -> Float32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else {
+            return nil
+        }
+
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        guard status == noErr else {
+            return nil
+        }
+
+        return value
+    }
+
+    private static func formatVolume(_ value: Float32) -> String {
+        String(format: "%.3f", Double(value))
+    }
+
+    private static func muteDevice(_ deviceID: AudioObjectID) -> DeviceMuteResult {
         var details: [String] = []
         var changed = false
 
@@ -280,7 +427,7 @@ private enum CoreAudioMuter {
             details.append("no settable output volume/mute property")
         }
 
-        return Result(changed: changed, details: details)
+        return DeviceMuteResult(changed: changed, details: details)
     }
 
     private static func setFloat32Property(
@@ -351,10 +498,13 @@ private enum CoreAudioMuter {
 private enum VolumeMuter {
     static func mute(reason: String) {
         let result = CoreAudioMuter.muteBuiltInSpeakers()
-        if result.changed {
+        switch result.status {
+        case .muted:
             Log.info("muted built-in speaker volume for \(reason): \(result.details.joined(separator: "; "))")
             SystemNotifier.showMutedNotification()
-        } else {
+        case .alreadySilent:
+            Log.info("skipped built-in speaker mute for \(reason): already silent; \(result.details.joined(separator: "; "))")
+        case .notFound, .failed:
             Log.error("did not mute built-in speaker for \(reason): \(result.details.joined(separator: "; "))")
         }
     }
